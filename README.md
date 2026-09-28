@@ -1,6 +1,6 @@
 # ZTEWifiPoweroffTimer
 
-Script per Raspberry Pi 4 che disattiva il Wi-Fi di un router ZTE (es. H3600) a mezzanotte e lo riattiva alle 07:00 tramite la console web (`192.168.1.1`).
+Script per Raspberry Pi 4 che disattiva e riattiva entrambe le frequenze Wi-Fi di un router ZTE H3601P tramite la console web (`192.168.1.1`). L’automazione usa Playwright per interagire con la pagina, senza chiamare API del router direttamente.
 
 ## 1) Installazione
 
@@ -9,6 +9,7 @@ cd /home/pi/ZTEWifiPoweroffTimer
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python -m playwright install chromium  # solo se non hai già Chrome/Chromium installato
 chmod +x zte_wifi_control.py install_cron.sh
 ```
 
@@ -49,7 +50,9 @@ Lo script installerà queste due esecuzioni in crontab:
 
 Log: `/var/log/zte-wifi-timer.log`
 
+Per vedere il browser durante un test aggiungi `--headed`. In caso di errore puoi salvare una schermata con `--screenshot-dir ./diagnostics`.
+
 ## Note
 
-- Alcuni firmware ZTE usano varianti diverse del payload di login: lo script prova più combinazioni comuni.
-- Se il tuo firmware usa parametri diversi, apri gli strumenti sviluppatore del browser mentre fai login/toggle Wi-Fi e adatta i payload in `zte_wifi_control.py`.
+- I testi dei menu e delle bande vengono cercati nella pagina: se il firmware è tradotto, adatta le stringhe in `_set_wifi` e `_login`.
+- Il percorso predefinito del browser è `/usr/bin/google-chrome`; puoi cambiarlo con `ZTE_BROWSER` o `--browser`.
