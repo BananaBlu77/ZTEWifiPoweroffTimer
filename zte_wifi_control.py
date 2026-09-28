@@ -160,8 +160,58 @@ def _click_apply_in_context(ctx: Page | Frame, timeout: int) -> bool:
     return False
 
 
+def _is_logged_in(page: Page) -> bool:
+    """Verifica se l'utente è già autenticato e si trova nella home del router."""
+    # 1. Se il campo password è visibile, siamo ancora nella schermata di login
+    for ctx in [page] + page.frames:
+        try:
+            if ctx.locator("input[type='password']").first.is_visible():
+                return False
+        except Exception:
+            pass
+
+    # 2. Se l'avviso 'configuring the device' è visibile, non siamo loggati
+    if _find_warning_context(page) is not None:
+        return False
+
+    # 3. Controlla se compare il pulsante Logout / Esci
+    for ctx in [page] + page.frames:
+        try:
+            logout_btn = ctx.locator("a, button, span, [role='button'], div").filter(
+                has_text=re.compile(r"^\s*(Logout|Esci|Log out)\s*$", re.IGNORECASE)
+            ).first
+            if logout_btn.is_visible():
+                return True
+        except Exception:
+            pass
+
+    # 4. Se la finestra di benvenuto iniziale non c'è più ed è presente la navigazione (es. Local Network)
+    welcome_visible = False
+    for ctx in [page] + page.frames:
+        try:
+            if ctx.locator("text=/Welcome to/i").first.is_visible():
+                welcome_visible = True
+                break
+        except Exception:
+            pass
+
+    if not welcome_visible:
+        for ctx in [page] + page.frames:
+            try:
+                if ctx.get_by_text("Local Network", exact=True).first.is_visible():
+                    return True
+            except Exception:
+                pass
+
+    return False
+
+
 def _release_existing_session(page: Page, timeout: int) -> bool:
     page.on("dialog", lambda dialog: dialog.accept())
+
+    # Se siamo già nella home, non c'è alcun avviso da gestire
+    if _is_logged_in(page):
+        return False
 
     # Attendi fino a 4 secondi per dare tempo al controllo asincrono del router
     deadline = time.time() + min(timeout, 4)
@@ -169,6 +219,8 @@ def _release_existing_session(page: Page, timeout: int) -> bool:
     warning_loc: Locator | None = None
 
     while time.time() < deadline:
+        if _is_logged_in(page):
+            return False
         res = _find_warning_context(page)
         if res:
             warning_ctx, warning_loc = res
@@ -190,27 +242,42 @@ def _release_existing_session(page: Page, timeout: int) -> bool:
         except Exception:
             pass
 
-    # Attendi che i campi di login siano pronti
-    print("[*] Attesa ricomparsa dei campi di login...")
-    deadline_login = time.time() + timeout
-    while time.time() < deadline_login:
+    # Attendi la transizione: o compare la home (accesso diretto) o ricompare il login
+    print("[*] Attesa transizione post-Apply (home o schermata di login)...")
+    deadline_transition = time.time() + timeout
+    while time.time() < deadline_transition:
+        # Se la home si è già caricata, non serve alcun login aggiuntivo
+        if _is_logged_in(page):
+            print("[*] Home del router caricata con successo (accesso automatico dopo Apply).")
+            page.wait_for_timeout(500)
+            return True
+
+        # Se compaiono i campi di login per reinserire credenziali
         for ctx in [page] + page.frames:
             try:
                 if ctx.locator("input[type='password']").first.is_visible():
+                    print("[*] Schermata di login pronta.")
                     page.wait_for_timeout(300)
                     return True
             except Exception:
                 pass
-        page.wait_for_timeout(200)
+        page.wait_for_timeout(250)
 
     return True
 
 
 def _login(page: Page, username: str, password: str, timeout: int) -> None:
-    # Se la schermata di avviso è presente prima di iniziare il login, rilasciamola
+    # Se siamo già autenticati (es. dopo Apply l'accesso è stato automatico), non fare nulla
+    if _is_logged_in(page):
+        print("[*] Già autenticati, passaggio diretto alla configurazione Wi-Fi.")
+        return
+
+    # Se invece la schermata di avviso è presente prima di iniziare il login, rilasciamola
     res = _find_warning_context(page)
     if res:
         _release_existing_session(page, timeout)
+        if _is_logged_in(page):
+            return
 
     username_field = _first_visible(
         page,
@@ -237,7 +304,12 @@ def _login(page: Page, username: str, password: str, timeout: int) -> None:
         if _find_warning_context(page):
             print("[!] Avviso di sessione attiva comparso dopo il login.")
             _release_existing_session(page, timeout)
-            _login(page, username, password, timeout)
+            if not _is_logged_in(page):
+                _login(page, username, password, timeout)
+            return
+
+        # Se la home è già caricata oppure la password si è nascosta, login completato
+        if _is_logged_in(page):
             return
 
         pw_visible = False
@@ -336,7 +408,11 @@ def main() -> int:
             except Exception:
                 pass
             _release_existing_session(page, args.timeout)
-            _login(page, args.username, args.password, args.timeout)
+            if not _is_logged_in(page):
+                print("[*] Esecuzione login...")
+                _login(page, args.username, args.password, args.timeout)
+            else:
+                print("[*] Accesso già effettuato alla home, login saltato.")
             enabled = args.action == "on"
             _set_wifi(page, enabled, args.timeout)
             state = "abilitato" if enabled else "disabilitato"
