@@ -7,17 +7,28 @@ import argparse
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
-from playwright.sync_api import Browser, Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import Browser, Frame, Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 
-def _first_visible(page: Page, selectors: tuple[str, ...]) -> Locator:
-    for selector in selectors:
-        locator = page.locator(selector).first
-        if locator.is_visible():
-            return locator
-    raise RuntimeError(f"Controllo non trovato nella pagina {page.url}")
+def _first_visible(page: Page, selectors: tuple[str, ...], timeout: int = 10) -> Locator:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        contexts: list[Page | Frame] = [page] + page.frames
+        for ctx in contexts:
+            for selector in selectors:
+                try:
+                    loc = ctx.locator(selector)
+                    for i in range(loc.count()):
+                        item = loc.nth(i)
+                        if item.is_visible():
+                            return item
+                except Exception:
+                    continue
+        page.wait_for_timeout(200)
+    raise RuntimeError(f"Controllo non trovato nella pagina {page.url} tra i selettori: {selectors}")
 
 
 def _click_text(page: Page, text: str, timeout: int) -> None:
@@ -33,42 +44,232 @@ def _open_accordion(page: Page, text: str, timeout: int) -> None:
     container.click()
 
 
+def _find_warning_context(page: Page) -> tuple[Page | Frame, Locator | None] | None:
+    patterns = [
+        re.compile(r"Another\s+user\s+is\s+configuring\s+the\s+device", re.IGNORECASE),
+        re.compile(r"force\s+the\s+user\s+to\s+logout", re.IGNORECASE),
+        re.compile(r"configuring\s+the\s+device", re.IGNORECASE),
+        re.compile(r"select\s+a\s+user\s+and\s+click\s+on", re.IGNORECASE),
+        re.compile(r"Another\s+user", re.IGNORECASE),
+    ]
+
+    contexts: list[Page | Frame] = [page] + page.frames
+    for ctx in contexts:
+        # Controllo 1: Playwright text locator
+        for pat in patterns:
+            try:
+                loc = ctx.get_by_text(pat).first
+                if loc.is_visible():
+                    return ctx, loc
+            except Exception:
+                pass
+
+        # Controllo 2: JavaScript su innerText, textContent e innerHTML con normalizzazione whitespace
+        try:
+            matched = ctx.evaluate("""() => {
+                const text = ((document.body ? document.body.innerText : '') + ' ' +
+                              (document.body ? document.body.textContent : '')).replace(/\\s+/g, ' ');
+                const html = document.body ? document.body.innerHTML : '';
+                const re = /configuring\\s+the\\s+device|force\\s+the\\s+user\\s+to\\s+logout|Another\\s+user/i;
+                return re.test(text) || re.test(html);
+            }""")
+            if matched:
+                return ctx, None
+        except Exception:
+            pass
+
+        # Controllo 3: Presenza combinata nel DOM di radio button utente e pulsanti Apply / Cancel
+        try:
+            matched_controls = ctx.evaluate("""() => {
+                const all = Array.from(document.querySelectorAll("input, button, a, div, span"));
+                const texts = all.map(el => (el.value || el.innerText || '').trim().toLowerCase());
+                const hasApply = texts.some(t => t === 'apply');
+                const hasCancel = texts.some(t => t === 'cancel');
+                const hasRadio = !!document.querySelector("input[type='radio']");
+                return (hasApply && hasCancel) || (hasRadio && hasApply);
+            }""")
+            if matched_controls:
+                return ctx, None
+        except Exception:
+            pass
+
+    return None
+
+
+def _click_apply_in_context(ctx: Page | Frame, timeout: int) -> bool:
+    # 1. Seleziona il radio button dell'utente attivo se non già selezionato
+    try:
+        ctx.evaluate("""() => {
+            const radio = document.querySelector("input[type='radio']");
+            if (radio && !radio.checked) {
+                radio.checked = true;
+                radio.dispatchEvent(new Event('change', { bubbles: true }));
+                radio.dispatchEvent(new Event('click', { bubbles: true }));
+            }
+        }""")
+    except Exception:
+        pass
+
+    # 2. Prova il click con selettori Playwright
+    apply_candidates = [
+        "input[type='button'][value='Apply' i]",
+        "input[type='submit'][value='Apply' i]",
+        "input[value='Apply' i]",
+        "button:has-text('Apply')",
+        "#Apply",
+        "#btnApply",
+        "#apply",
+        "#btn_apply",
+        "#Btn_apply",
+        "[role='button']:has-text('Apply')",
+        "a:has-text('Apply')",
+        "div:has-text('Apply')",
+        "span:has-text('Apply')",
+    ]
+
+    for sel in apply_candidates:
+        try:
+            btn = ctx.locator(sel).first
+            if btn.is_visible():
+                btn.click()
+                return True
+        except Exception:
+            continue
+
+    # 3. Fallback JavaScript: click diretto con scroll ed eventi mousedown/mouseup/click
+    try:
+        clicked = ctx.evaluate("""() => {
+            const elements = Array.from(document.querySelectorAll("input, button, a, div, span"));
+            for (const el of elements) {
+                const val = (el.value || el.innerText || '').trim();
+                if (/^apply$/i.test(val)) {
+                    el.scrollIntoView();
+                    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        if clicked:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _release_existing_session(page: Page, timeout: int) -> bool:
+    page.on("dialog", lambda dialog: dialog.accept())
+
+    # Attendi fino a 4 secondi per dare tempo al controllo asincrono del router
+    deadline = time.time() + min(timeout, 4)
+    warning_ctx: Page | Frame | None = None
+    warning_loc: Locator | None = None
+
+    while time.time() < deadline:
+        res = _find_warning_context(page)
+        if res:
+            warning_ctx, warning_loc = res
+            break
+        page.wait_for_timeout(250)
+
+    if not warning_ctx:
+        return False
+
+    print("[!] Rilevata finestra di avviso: un altro utente sta configurando il dispositivo.")
+    print("[*] Selezione dell'utente e click su 'Apply' per forzare il logout...")
+    _click_apply_in_context(warning_ctx, timeout)
+    page.wait_for_timeout(1000)
+
+    # Attendi che l'avviso scompaia
+    if warning_loc:
+        try:
+            warning_loc.wait_for(state="hidden", timeout=timeout * 1000)
+        except Exception:
+            pass
+
+    # Attendi che i campi di login siano pronti
+    print("[*] Attesa ricomparsa dei campi di login...")
+    deadline_login = time.time() + timeout
+    while time.time() < deadline_login:
+        for ctx in [page] + page.frames:
+            try:
+                if ctx.locator("input[type='password']").first.is_visible():
+                    page.wait_for_timeout(300)
+                    return True
+            except Exception:
+                pass
+        page.wait_for_timeout(200)
+
+    return True
+
+
 def _login(page: Page, username: str, password: str, timeout: int) -> None:
+    # Se la schermata di avviso è presente prima di iniziare il login, rilasciamola
+    res = _find_warning_context(page)
+    if res:
+        _release_existing_session(page, timeout)
+
     username_field = _first_visible(
         page,
         ("input[name*='user' i]", "input[id*='user' i]", "input[type='text']"),
+        timeout=timeout,
     )
-    password_field = _first_visible(page, ("input[type='password']", "input[name*='pass' i]"))
+    password_field = _first_visible(
+        page,
+        ("input[type='password']", "input[name*='pass' i]"),
+        timeout=timeout,
+    )
     username_field.fill(username)
     password_field.fill(password)
     login_button = _first_visible(
         page,
         ("button:has-text('Login')", "button:has-text('Accedi')", "input[type='submit']"),
+        timeout=timeout,
     )
     login_button.click()
-    try:
-        page.locator("input[type='password']").first.wait_for(state="hidden", timeout=timeout * 1000)
-    except PlaywrightTimeoutError as exc:
-        raise RuntimeError("Login fallito: controlla username e password") from exc
+
+    # Controlla se il login va a buon fine o se l'avviso di sessione compare dopo il submit
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _find_warning_context(page):
+            print("[!] Avviso di sessione attiva comparso dopo il login.")
+            _release_existing_session(page, timeout)
+            _login(page, username, password, timeout)
+            return
+
+        pw_visible = False
+        for ctx in [page] + page.frames:
+            try:
+                if ctx.locator("input[type='password']").first.is_visible():
+                    pw_visible = True
+                    break
+            except Exception:
+                pass
+        if not pw_visible:
+            return
+
+        page.wait_for_timeout(300)
+
+    raise RuntimeError("Login fallito: controlla username e password (timeout attesa completamento login)")
 
 
 def _click_band_toggle(page: Page, band_pattern: str, enabled: bool) -> None:
-    labels = page.locator("label").filter(has_text=re.compile(band_pattern, re.IGNORECASE))
-    for index in range(labels.count()):
-        control = labels.nth(index).locator("input[type='checkbox'], input[type='radio']").first
-        if control.count():
-            if control.is_checked() != enabled:
-                control.check(force=True)
-            return
-
-    row = page.locator("tr, li, .form-group, .form-item, .row").filter(
+    row = page.locator(
+        "tr, li, .form-group, .form-item, .row"
+    ).filter(
         has_text=re.compile(band_pattern, re.IGNORECASE)
     ).first
-    control = row.locator("input[type='checkbox'], input[type='radio']").first
-    if not control.count():
-        raise RuntimeError(f"Interruttore della banda {band_pattern} non trovato")
-    if control.is_checked() != enabled:
-        control.check(force=True)
+
+    radios = row.locator("input[type='radio']")
+    if radios.count() < 2:
+        raise RuntimeError(f"Radio On/Off della banda {band_pattern} non trovati")
+
+    # Primo radio = On, secondo radio = Off
+    target = radios.nth(0 if enabled else 1)
+    target.check(force=True)
 
 
 def _set_wifi(page: Page, enabled: bool, timeout: int) -> None:
@@ -84,6 +285,18 @@ def _set_wifi(page: Page, enabled: bool, timeout: int) -> None:
     save.wait_for(state="visible", timeout=timeout * 1000)
     save.click()
     page.wait_for_timeout(500)
+
+
+def _logout(page: Page) -> None:
+    try:
+        logout_btn = page.locator("a, button, span, [role='button']").filter(
+            has_text=re.compile(r"^\s*(Logout|Esci|Log out)\s*$", re.IGNORECASE)
+        ).first
+        if logout_btn.is_visible():
+            logout_btn.click()
+            page.wait_for_timeout(500)
+    except Exception:
+        pass
 
 
 def _launch_browser(browser: Browser, executable_path: str | None, headless: bool):
@@ -117,18 +330,31 @@ def main() -> int:
         with sync_playwright() as playwright:
             browser = _launch_browser(playwright, args.browser, not args.headed)
             page = browser.new_page()
-            page.goto(f"http://{args.host}/", wait_until="domcontentloaded", timeout=args.timeout * 1000)
+            page.goto(f"http://{args.host}/", wait_until="load", timeout=args.timeout * 1000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
+            _release_existing_session(page, args.timeout)
             _login(page, args.username, args.password, args.timeout)
             enabled = args.action == "on"
             _set_wifi(page, enabled, args.timeout)
             state = "abilitato" if enabled else "disabilitato"
             print(f"Wi-Fi 2.4 GHz e 5 GHz {state} con successo")
+            _logout(page)
             browser.close()
         return 0
     except (PlaywrightTimeoutError, RuntimeError) as exc:
-        if args.screenshot_dir and page:
+        if page and args.screenshot_dir:
             args.screenshot_dir.mkdir(parents=True, exist_ok=True)
-            page.screenshot(path=str(args.screenshot_dir / "zte-wifi-error.png"), full_page=True)
+            try:
+                page.screenshot(path=str(args.screenshot_dir / "zte-wifi-error.png"), full_page=True)
+            except Exception:
+                pass
+            try:
+                (args.screenshot_dir / "zte-page-source.html").write_text(page.content(), encoding="utf-8")
+            except Exception:
+                pass
         print(f"Errore nella console web: {exc}", file=sys.stderr)
         return 1
 
